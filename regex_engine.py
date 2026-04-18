@@ -1,4 +1,5 @@
 import sys
+import string
 
 class RegexNode:
     """Base class for regex AST nodes."""
@@ -20,11 +21,25 @@ class AnyCharNode(RegexNode):
 class CharSetNode(RegexNode):
     """Matches any character in a set (e.g., [abc])."""
     def __init__(self, chars, negate=False):
+        # Ensure chars is always a set for efficient lookup
         self.chars = set(chars)
         self.negate = negate
 
     def __repr__(self):
-        return f"CharSet({'^' if self.negate else ''}[{''.join(sorted(list(self.chars)))}])"
+        # For readability, represent a subset if too large, or special names
+        if self.negate:
+            if self.chars == set(string.digits):
+                return "CharSet('\\D')"
+            # ... add more special cases if desired for negated sets
+            return f"CharSet(NOT {''.join(sorted(list(self.chars)))})"
+        else:
+            if self.chars == set(string.digits):
+                return "CharSet('\\d')"
+            if self.chars == set(string.ascii_letters + string.digits + '_'):
+                return "CharSet('\\w')"
+            if self.chars == set(string.whitespace):
+                return "CharSet('\\s')"
+            return f"CharSet([{''.join(sorted(list(self.chars)))}])"
 
 class QuantifierNode(RegexNode):
     """Applies a quantifier (*, +, ?) to a sub-expression."""
@@ -59,6 +74,21 @@ class GroupNode(RegexNode):
     def __repr__(self):
         return f"Group({self.node})"
 
+class StartAnchorNode(RegexNode):
+    """Matches the beginning of the string (^)."""
+    def __repr__(self):
+        return "StartAnchor"
+
+class EndAnchorNode(RegexNode):
+    """Matches the end of the string ($)."""
+    def __repr__(self):
+        return "EndAnchor"
+
+# Pre-defined character sets for escapes
+DIGITS = set(string.digits)
+WORD_CHARS = set(string.ascii_letters + string.digits + '_')
+WHITESPACE_CHARS = set(string.whitespace)
+
 
 class RegexParser:
     """Parses a regular expression string into an AST."""
@@ -79,8 +109,31 @@ class RegexParser:
         return None
 
     def parse(self):
-        # Top-level parsing starts with alternation, which has lowest precedence
-        return self._parse_alternation()
+        # Top-level parsing: handle anchors if present
+        nodes = []
+        if self.peek() == '^':
+            self.consume()
+            nodes.append(StartAnchorNode())
+
+        # Parse the main expression (alternation is lowest precedence)
+        main_expr = self._parse_alternation()
+        if main_expr:
+            nodes.append(main_expr)
+
+        if self.peek() == '$':
+            self.consume()
+            nodes.append(EndAnchorNode())
+        
+        if self.peek() is not None:
+            raise ValueError(f"Unexpected character at end of pattern: '{self.peek()}'")
+
+        if not nodes:
+            return None # Represents an empty pattern
+
+        # If it's just one node, return it. Otherwise, wrap in a ConcatNode.
+        if len(nodes) == 1:
+            return nodes[0]
+        return ConcatNode(nodes)
 
     def _parse_alternation(self):
         # An alternation is a sequence of concatenations separated by '|'
@@ -88,7 +141,12 @@ class RegexParser:
 
         while self.peek() == '|':
             self.consume() # Consume '|'
-            alternatives.append(self._parse_concat())
+            alternative = self._parse_concat()
+            if alternative is None: # e.g., "a|" or "a||b"
+                # An empty alternative is valid, it matches the empty string
+                alternatives.append(ConcatNode([]))
+            else:
+                alternatives.append(alternative)
         
         if len(alternatives) == 1:
             return alternatives[0]
@@ -97,15 +155,16 @@ class RegexParser:
     def _parse_concat(self):
         nodes = []
         # Concatenation stops at end, '|' (handled by _parse_alternation), or ')' (group end)
-        while self.peek() not in (None, '|', ')'):
+        # Anchors ^ $ are handled at the top level
+        while self.peek() not in (None, '|', ')', '^', '$'):
             node = self._parse_atom()
             if node:
                 nodes.append(node)
             else:
-                break # No more atoms to parse (e.g., hit a quantifier after nothing, or end)
+                break # No more atoms to parse (e.g., hit an invalid char, or end)
 
         if not nodes:
-            return None # Represents an empty pattern
+            return None # Represents an empty concatenation (matches empty string)
         if len(nodes) == 1:
             return nodes[0]
         return ConcatNode(nodes)
@@ -127,15 +186,29 @@ class RegexParser:
             self.consume() # Consume '\'
             escaped_char = self.consume()
             if escaped_char is None:
-                raise ValueError("Incomplete escape sequence")
-            node = LiteralNode(escaped_char)
-        elif char not in '*+?': # Literal character, or other special chars like ')' should not be here
+                raise ValueError("Incomplete escape sequence at end of pattern")
+            
+            # Handle character class escapes
+            if escaped_char == 'd':
+                node = CharSetNode(DIGITS)
+            elif escaped_char == 'D':
+                node = CharSetNode(DIGITS, negate=True)
+            elif escaped_char == 'w':
+                node = CharSetNode(WORD_CHARS)
+            elif escaped_char == 'W':
+                node = CharSetNode(WORD_CHARS, negate=True)
+            elif escaped_char == 's':
+                node = CharSetNode(WHITESPACE_CHARS)
+            elif escaped_char == 'S':
+                node = CharSetNode(WHITESPACE_CHARS, negate=True)
+            else:
+                # Other escaped characters become literals (e.g., \*, \+, \.)
+                node = LiteralNode(escaped_char)
+        elif char not in '*+?': # Literal character, or other special chars like ')' that end groups
             self.consume()
             node = LiteralNode(char)
         else:
-            # This is a special character not acting as an atom in this context
-            # (e.g., a quantifier without a preceding element, or an unmatched parenthesis)
-            # For now, let it be handled implicitly by returning None.
+            # This is a special character that cannot start an atom (e.g., an unmatched quantifier, or unescaped anchor inside concat)
             return None
 
         if node:
@@ -189,8 +262,14 @@ class RegexEngine:
     def __init__(self, pattern):
         parser = RegexParser(pattern)
         parsed_ast = parser.parse()
-        # The top-level AST can now be an AlternationNode or GroupNode, not just ConcatNode
-        self.top_level_node = parsed_ast
+        # The top-level AST can now be an AlternationNode, GroupNode, or ConcatNode (if anchors are present)
+        # Ensure it's always iterable for _match_recursive
+        if parsed_ast is None:
+            self.top_level_nodes = []
+        elif isinstance(parsed_ast, ConcatNode):
+            self.top_level_nodes = parsed_ast.nodes
+        else:
+            self.top_level_nodes = [parsed_ast]
 
     def _match_single_char_node(self, node, text, text_idx):
         """
@@ -198,7 +277,7 @@ class RegexEngine:
         Returns text_idx + 1 if successful, None otherwise.
         """
         if text_idx >= len(text):
-            return None # Cannot match beyond end of text
+            return None # Cannot match beyond end of text for consuming nodes
 
         char = text[text_idx]
 
@@ -229,9 +308,21 @@ class RegexEngine:
         # --- Handle matching of the current_node itself ---
 
         if current_node is None:
-            # An empty node (e.g., from an empty group or empty pattern) effectively matches zero width.
+            # An empty node (e.g., from an empty group or empty pattern segment) effectively matches zero width.
             # Continue to match the rest of the pattern.
             return self._match_next_node(text, text_idx, next_pattern_nodes_iter)
+        
+        elif isinstance(current_node, StartAnchorNode):
+            if text_idx == 0:
+                # Start anchor is a zero-width assertion, successfully matched.
+                return self._match_next_node(text, text_idx, next_pattern_nodes_iter)
+            return None # Failed to match start anchor
+
+        elif isinstance(current_node, EndAnchorNode):
+            if text_idx == len(text):
+                # End anchor is a zero-width assertion, successfully matched.
+                return self._match_next_node(text, text_idx, next_pattern_nodes_iter)
+            return None # Failed to match end anchor
 
         elif isinstance(current_node, LiteralNode) or \
              isinstance(current_node, AnyCharNode) or \
@@ -248,8 +339,8 @@ class RegexEngine:
             quantifier = current_node.quantifier
 
             if quantifier == '?': # Zero or one
-                # Option 1: Try matching one
-                matched_one_idx = self._match_single_char_node(sub_node, text, text_idx)
+                # Option 1: Try matching one (recursively, as sub_node could be complex)
+                matched_one_idx = self._match_recursive(sub_node, text, text_idx, iter([]))
                 if matched_one_idx is not None:
                     # If matching one succeeds, try to match the rest of the pattern
                     result = self._match_next_node(text, matched_one_idx, next_pattern_nodes_iter)
@@ -264,8 +355,9 @@ class RegexEngine:
                 matched_indices = [text_idx] # Always can match zero times
                 current_temp_idx = text_idx
                 while True:
-                    potential_next_idx = self._match_single_char_node(sub_node, text, current_temp_idx)
-                    if potential_next_idx is not None:
+                    # Match sub_node (potentially complex) from current_temp_idx
+                    potential_next_idx = self._match_recursive(sub_node, text, current_temp_idx, iter([]))
+                    if potential_next_idx is not None and potential_next_idx > current_temp_idx: # Ensure progress for zero-width sub_nodes
                         current_temp_idx = potential_next_idx
                         matched_indices.append(current_temp_idx)
                     else:
@@ -281,7 +373,7 @@ class RegexEngine:
 
             elif quantifier == '+': # One or more (greedy, with backtracking)
                 # Must match at least one
-                first_match_idx = self._match_single_char_node(sub_node, text, text_idx)
+                first_match_idx = self._match_recursive(sub_node, text, text_idx, iter([]))
                 if first_match_idx is None:
                     return None # Failed to match even one
 
@@ -289,8 +381,8 @@ class RegexEngine:
                 matched_indices = [first_match_idx] # Matched at least once
                 current_temp_idx = first_match_idx
                 while True:
-                    potential_next_idx = self._match_single_char_node(sub_node, text, current_temp_idx)
-                    if potential_next_idx is not None:
+                    potential_next_idx = self._match_recursive(sub_node, text, current_temp_idx, iter([]))
+                    if potential_next_idx is not None and potential_next_idx > current_temp_idx: # Ensure progress for zero-width sub_nodes
                         current_temp_idx = potential_next_idx
                         matched_indices.append(current_temp_idx)
                     else:
@@ -343,17 +435,23 @@ class RegexEngine:
 
     def match(self, text, start_idx=0):
         """Attempts to match the pattern from start_idx in text."""
-        # Wrap the top-level node in an iterator for _match_recursive
-        return self._match_recursive(self.top_level_node, text, start_idx, iter([])) # Empty iterator as there's no 'next' after top-level
+        # Wrap the top-level nodes in an iterator for _match_recursive
+        top_level_iter = iter(self.top_level_nodes)
+        try:
+            first_node = next(top_level_iter)
+            return self._match_recursive(first_node, text, start_idx, top_level_iter)
+        except StopIteration:
+            # Empty pattern (or pattern that evaluates to empty, like "()") always matches.
+            # In this context (match from start_idx), it's a zero-width match at start_idx.
+            return start_idx
 
     def find(self, text):
         """
         Finds the first occurrence of the pattern in text.
         Returns (start_index, end_index) if found, None otherwise.
         """
-        # Iterate through all possible starting positions in the text
         for i in range(len(text) + 1):
-            end_idx = self._match_recursive(self.top_level_node, text, i, iter([]))
+            end_idx = self.match(text, i) # Reuse match for finding
             if end_idx is not None:
                 return (i, end_idx)
         return None
@@ -366,13 +464,10 @@ class RegexEngine:
         matches = []
         text_idx = 0
         while text_idx <= len(text):
-            # Check for a match at the current text_idx
-            end_idx = self._match_recursive(self.top_level_node, text, text_idx, iter([]))
+            end_idx = self.match(text, text_idx)
             if end_idx is not None:
-                # Found a match
                 if end_idx == text_idx:
-                    # This is a zero-width match. To avoid infinite loops,
-                    # we must advance the text_idx by at least one.
+                    # Zero-width match. Add it, then force advance text_idx by 1 to prevent infinite loop.
                     matches.append((text_idx, end_idx))
                     text_idx += 1 
                 else:
@@ -399,7 +494,8 @@ def main():
 
     try:
         engine = RegexEngine(pattern)
-        print(f"Parsed AST (top-level node): {engine.top_level_node}")
+        # For top_level_nodes, it could be a list of nodes now due to anchors
+        print(f"Parsed AST (top-level nodes): {engine.top_level_nodes}")
         print("-" * 30)
 
         # Test 'match' (prefix match)

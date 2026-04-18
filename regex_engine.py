@@ -10,12 +10,12 @@ class LiteralNode(RegexNode):
         self.char = char
 
     def __repr__(self):
-        return f"'{self.char}'"
+        return f"Literal('{self.char}')"
 
 class AnyCharNode(RegexNode):
     """Matches any single character (.)."""
     def __repr__(self):
-        return "."
+        return "AnyChar"
 
 class CharSetNode(RegexNode):
     """Matches any character in a set (e.g., [abc])."""
@@ -24,7 +24,7 @@ class CharSetNode(RegexNode):
         self.negate = negate
 
     def __repr__(self):
-        return f"{'^' if self.negate else ''}[{''.join(sorted(list(self.chars)))}]"
+        return f"CharSet({'^' if self.negate else ''}[{''.join(sorted(list(self.chars)))}])"
 
 class QuantifierNode(RegexNode):
     """Applies a quantifier (*, +, ?) to a sub-expression."""
@@ -33,7 +33,7 @@ class QuantifierNode(RegexNode):
         self.quantifier = quantifier # '*', '+', '?'
 
     def __repr__(self):
-        return f"({self.node}){self.quantifier}"
+        return f"Quantifier({self.node}, '{self.quantifier}')"
 
 class ConcatNode(RegexNode):
     """Concatenates multiple regex nodes (e.g., 'ab')."""
@@ -41,7 +41,7 @@ class ConcatNode(RegexNode):
         self.nodes = nodes
 
     def __repr__(self):
-        return f"({''.join(str(n) for n in self.nodes)})"
+        return f"Concat({[str(n) for n in self.nodes]})"
 
 class RegexParser:
     """Parses a regular expression string into an AST."""
@@ -62,6 +62,7 @@ class RegexParser:
         return None
 
     def parse(self):
+        # A pattern is essentially a concatenation of atoms
         return self._parse_concat()
 
     def _parse_concat(self):
@@ -71,10 +72,10 @@ class RegexParser:
             if node:
                 nodes.append(node)
             else:
-                break # No more atoms to parse (e.g., hit a quantifier after nothing)
+                break # No more atoms to parse (e.g., hit a quantifier after nothing, or end)
 
         if not nodes:
-            return None # Or raise error, or represent empty pattern. For now, assume always content.
+            return None # Represents an empty pattern
         if len(nodes) == 1:
             return nodes[0]
         return ConcatNode(nodes)
@@ -82,8 +83,8 @@ class RegexParser:
     def _parse_atom(self):
         char = self.peek()
         if char is None:
-            return None
-        
+            return None # End of pattern
+
         node = None
         if char == '.':
             self.consume()
@@ -100,7 +101,10 @@ class RegexParser:
             self.consume()
             node = LiteralNode(char)
         else:
-            return None # This isn't an atom for _parse_atom, maybe part of _parse_concat logic later
+            # This is a special character not acting as an atom in this context
+            # (e.g., a quantifier without a preceding element, or an unmatched parenthesis)
+            # For now, let it be handled implicitly by returning None.
+            return None
 
         if node:
             # Check for quantifiers
@@ -135,151 +139,141 @@ class RegexEngine:
     """Matches text against a compiled regex AST."""
     def __init__(self, pattern):
         parser = RegexParser(pattern)
-        self.ast = parser.parse()
+        parsed_ast = parser.parse()
+        # Ensure the top-level AST is always a list of nodes for easier processing
+        if isinstance(parsed_ast, ConcatNode):
+            self.pattern_nodes = parsed_ast.nodes
+        elif parsed_ast is None:
+            self.pattern_nodes = [] # Represents an empty pattern
+        else:
+            self.pattern_nodes = [parsed_ast]
+
+    def _match_single_node(self, node, text, text_idx):
+        """
+        Attempts to match a single AST node at text_idx.
+        Returns text_idx + 1 if successful, None otherwise.
+        """
+        if text_idx >= len(text):
+            return None # Cannot match beyond end of text
+
+        char = text[text_idx]
+
+        if isinstance(node, LiteralNode):
+            return text_idx + 1 if char == node.char else None
+
+        elif isinstance(node, AnyCharNode):
+            return text_idx + 1
+
+        elif isinstance(node, CharSetNode):
+            is_in_set = char in node.chars
+            if node.negate:
+                return text_idx + 1 if not is_in_set else None
+            else:
+                return text_idx + 1 if is_in_set else None
+        
+        # QuantifierNode and ConcatNode are handled by _match_recursive, not _match_single_node
+        # If this is reached, something is wrong in the call logic.
+        raise ValueError(f"'_match_single_node' called with invalid node type: {type(node)}")
+
+    def _match_recursive(self, pattern_nodes, text, text_idx):
+        """
+        Core recursive backtracking function.
+        Attempts to match the list of pattern_nodes against text starting from text_idx.
+        Returns the index after the match if successful, None otherwise.
+        """
+        # Base case: All pattern nodes have been matched
+        if not pattern_nodes:
+            return text_idx
+
+        current_node = pattern_nodes[0]
+        rest_of_pattern = pattern_nodes[1:]
+
+        if isinstance(current_node, ConcatNode):
+            # Flatten concat nodes into the current pattern_nodes list for easier iteration
+            # This makes the AST slightly less "pure" but simplifies recursive matching.
+            # Alternatively, _match_recursive would take (current_node, rest_of_pattern) and iterate current_node.nodes
+            # For simplicity, let's treat it as a sequence to be matched.
+            return self._match_recursive(current_node.nodes + rest_of_pattern, text, text_idx)
+
+        elif isinstance(current_node, QuantifierNode):
+            sub_node = current_node.node
+            quantifier = current_node.quantifier
+
+            if quantifier == '?': # Zero or one
+                # Try matching one
+                matched_one_idx = self._match_single_node(sub_node, text, text_idx)
+                if matched_one_idx is not None:
+                    # If matching one succeeds, try to match the rest of the pattern
+                    result = self._match_recursive(rest_of_pattern, text, matched_one_idx)
+                    if result is not None:
+                        return result
+                
+                # If matching one failed or did not lead to a full match, try matching zero
+                return self._match_recursive(rest_of_pattern, text, text_idx)
+
+            elif quantifier == '*': # Zero or more (greedy, with backtracking)
+                # First, try to match the sub_node as many times as possible (greedy phase)
+                matched_lengths = [0] # Always can match zero times
+                current_len = 0
+                while True:
+                    potential_next_idx = self._match_single_node(sub_node, text, text_idx + current_len)
+                    if potential_next_idx is not None:
+                        current_len = potential_next_idx - text_idx
+                        matched_lengths.append(current_len)
+                    else:
+                        break
+                
+                # Now, backtrack: try matching the rest of the pattern with decreasing matches of sub_node
+                # (from max matches down to zero matches)
+                for length in reversed(matched_lengths):
+                    result = self._match_recursive(rest_of_pattern, text, text_idx + length)
+                    if result is not None:
+                        return result
+                return None # No path led to a full match
+
+            elif quantifier == '+': # One or more (greedy, with backtracking)
+                # Must match at least one
+                first_match_idx = self._match_single_node(sub_node, text, text_idx)
+                if first_match_idx is None:
+                    return None # Failed to match even one
+                
+                # Similar to *, but starting from 1 match
+                matched_lengths = [first_match_idx - text_idx] # Matched at least once
+                current_len = first_match_idx - text_idx
+                while True:
+                    potential_next_idx = self._match_single_node(sub_node, text, text_idx + current_len)
+                    if potential_next_idx is not None:
+                        current_len = potential_next_idx - text_idx
+                        matched_lengths.append(current_len)
+                    else:
+                        break
+                
+                # Backtrack from max matches down to 1 match
+                for length in reversed(matched_lengths):
+                    result = self._match_recursive(rest_of_pattern, text, text_idx + length)
+                    if result is not None:
+                        return result
+                return None # No path led to a full match
+
+        else: # Regular Literal, AnyChar, CharSet node
+            next_text_idx = self._match_single_node(current_node, text, text_idx)
+            if next_text_idx is not None:
+                return self._match_recursive(rest_of_pattern, text, next_text_idx)
+            return None # Current node did not match
 
     def match(self, text, start_idx=0):
         """Attempts to match the pattern from start_idx in text."""
-        return self._match_node(self.ast, text, start_idx)
-
-    def _match_node(self, node, text, text_idx):
-        """
-        Recursive function to match a node against text starting from text_idx.
-        Returns the index after the match if successful, None otherwise.
-        """
-        if node is None:
-            return text_idx # Empty pattern matches immediately
-
-        if isinstance(node, LiteralNode):
-            if text_idx < len(text) and text[text_idx] == node.char:
-                return text_idx + 1
-            return None
-
-        elif isinstance(node, AnyCharNode):
-            if text_idx < len(text):
-                return text_idx + 1
-            return None
-
-        elif isinstance(node, CharSetNode):
-            if text_idx < len(text):
-                char = text[text_idx]
-                is_in_set = char in node.chars
-                if node.negate:
-                    if not is_in_set:
-                        return text_idx + 1
-                else:
-                    if is_in_set:
-                        return text_idx + 1
-            return None
-
-        elif isinstance(node, ConcatNode):
-            current_idx = text_idx
-            for sub_node in node.nodes:
-                next_idx = self._match_node(sub_node, text, current_idx)
-                if next_idx is None:
-                    return None # Sub-node failed to match
-                current_idx = next_idx
-            return current_idx # All sub-nodes matched
-
-        elif isinstance(node, QuantifierNode):
-            return self._match_quantifier(node.node, node.quantifier, text, text_idx)
-
-        raise ValueError(f"Unknown AST node type: {type(node)}")
-
-    def _match_quantifier(self, sub_node, quantifier, text, text_idx):
-        """Handles *, +, ? quantifiers using backtracking."""
-        if quantifier == '?': # Zero or one
-            # Try matching one
-            next_idx = self._match_node(sub_node, text, text_idx)
-            if next_idx is not None:
-                return next_idx # Matched one, prioritize this
-            # If not, try matching zero (i.e., just skip it)
-            return text_idx
-
-        elif quantifier == '*': # Zero or more (greedy)
-            i = 0
-            while True:
-                next_idx = self._match_node(sub_node, text, text_idx + i)
-                if next_idx is None:
-                    break # Failed to match the sub_node again
-                i = next_idx - text_idx
-            
-            # Now, backtrack. Try matching 0, then 1, then 2, etc.
-            # This is the tricky part for greedy *
-            # We matched 'i' times. We now need to try to match the rest of the pattern
-            # starting from text_idx + i, then text_idx + (i-1), etc.
-
-            # The current _match_node only matches one specific node.
-            # To correctly implement greedy *, we need to integrate it into the main `find` logic.
-            # For `match` (full prefix match), * is simpler: match as many as possible, then try to continue.
-            # This implementation assumes the quantifier is at the end of the pattern, or
-            # the _match_node handles it correctly. Let's fix this for arbitrary sub-nodes.
-
-            # Correct greedy * implementation (match as many as possible)
-            current_match_length = 0
-            while True:
-                potential_next_idx = self._match_node(sub_node, text, text_idx + current_match_length)
-                if potential_next_idx is not None:
-                    current_match_length = potential_next_idx - text_idx
-                else:
-                    break # No more matches for sub_node
-            
-            # The 'current_match_length' is the maximum successful matches
-            return text_idx + current_match_length # This will effectively consume all it can.
-                                                  # But for a real regex engine, this needs to be integrated
-                                                  # with backtracking for the *entire* pattern.
-
-            # For now, let's implement * using "try matching N, then N-1, ..., 0"
-            # This requires knowing the 'next' node in the pattern, which we don't have
-            # at this scope. The current `_match_node` is designed to match a *single* node.
-            # This means the backtracking logic for quantifiers must be lifted
-            # to the `find` or `_search` method that iterates through the pattern's nodes.
-
-            # Re-thinking for `_match_node` to return the *length* of match for simplicity
-            # For a simpler greedy *, let's just consume as many as possible.
-            # This won't work for `a*a` against `aaaa`, as `a*` would consume all `aaaa`.
-            # A full backtracking engine would need the 'rest_of_pattern' argument.
-
-            # Let's adjust the `_match_node` to take `rest_of_pattern` or lift quantifier logic.
-            # For this simple engine, I will make the greedy quantifiers behave as "match as much as possible, then return".
-            # This will *not* support full backtracking for patterns like `a*a` against `aaa`.
-            # A correct approach would be to pass `rest_of_pattern` or use an NFA simulation.
-            # Sticking to simple recursion for now, treating quantifiers as self-contained.
-
-            # Simple greedy *:
-            idx_after_matches = text_idx
-            while True:
-                potential_idx = self._match_node(sub_node, text, idx_after_matches)
-                if potential_idx is not None:
-                    idx_after_matches = potential_idx
-                else:
-                    break
-            return idx_after_matches
-
-        elif quantifier == '+': # One or more (greedy)
-            # Must match at least one
-            first_match_idx = self._match_node(sub_node, text, text_idx)
-            if first_match_idx is None:
-                return None # Failed to match even one
-            
-            # Then match zero or more (same as *)
-            idx_after_matches = first_match_idx
-            while True:
-                potential_idx = self._match_node(sub_node, text, idx_after_matches)
-                if potential_idx is not None:
-                    idx_after_matches = potential_idx
-                else:
-                    break
-            return idx_after_matches
-
-        return None
+        return self._match_recursive(self.pattern_nodes, text, start_idx)
 
     def find(self, text):
         """
         Finds the first occurrence of the pattern in text.
         Returns (start_index, end_index) if found, None otherwise.
         """
-        for i in range(len(text) + 1): # +1 to allow matching empty string at end
-            end_idx = self._match_node(self.ast, text, i)
+        # Iterate through all possible starting positions in the text
+        # If the pattern is empty, it should match at any position (zero-width match)
+        for i in range(len(text) + 1):
+            end_idx = self._match_recursive(self.pattern_nodes, text, i)
             if end_idx is not None:
                 return (i, end_idx)
         return None
@@ -292,20 +286,24 @@ class RegexEngine:
         matches = []
         text_idx = 0
         while text_idx <= len(text):
-            end_idx = self._match_node(self.ast, text, text_idx)
+            # Check for a match at the current text_idx
+            end_idx = self._match_recursive(self.pattern_nodes, text, text_idx)
             if end_idx is not None:
-                if end_idx == text_idx: # Prevent infinite loop for zero-width matches
-                    if self.ast is None: # Empty pattern matches everywhere, but we only add one per position
-                        matches.append((text_idx, end_idx))
-                    # For non-empty zero-width matches (e.g., a* on 'bbb', first 'b' is a match of '' followed by 'b')
-                    # This case needs more sophisticated handling or specific rules.
-                    # For this simple engine, we skip and advance by 1 for zero-width to prevent loops.
-                    text_idx += 1
-                    continue
-                matches.append((text_idx, end_idx))
-                text_idx = end_idx # Continue search after the found match
+                # Found a match
+                if end_idx == text_idx:
+                    # This is a zero-width match. To avoid infinite loops,
+                    # we must advance the text_idx by at least one.
+                    # For example, 'a*' against 'b' would match '' at index 0.
+                    # We add the match, then forcefully advance.
+                    matches.append((text_idx, end_idx))
+                    text_idx += 1 
+                else:
+                    # Non-zero-width match, advance text_idx to after the match
+                    matches.append((text_idx, end_idx))
+                    text_idx = end_idx
             else:
-                text_idx += 1 # No match at this position, try next
+                # No match at this position, try the next character
+                text_idx += 1
         return matches
 
 
@@ -323,7 +321,7 @@ def main():
 
     try:
         engine = RegexEngine(pattern)
-        print(f"Parsed AST: {engine.ast}")
+        print(f"Parsed AST (top-level nodes): {engine.pattern_nodes}")
         print("-" * 30)
 
         # Test 'match' (prefix match)
